@@ -1,15 +1,21 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/disintegration/imaging"
 	_ "github.com/lib/pq"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -19,7 +25,8 @@ import (
 type Task struct {
 	TaskID     string      `json:"task_id"`
 	Operations []Operation `json:"operations"`
-	SourcePath string      `json:"source_path"`
+	ObjectName string      `json:"object_name"` // вместо SourcePath
+	Bucket     string      `json:"bucket"`
 }
 
 type Operation struct {
@@ -35,6 +42,17 @@ type Worker struct {
 }
 
 func main() {
+	log.Println("🚀 Starting Image Processing Worker...")
+
+	// ОТЛАДКА: выводим все переменные окружения
+	log.Println("Environment variables:")
+	log.Printf("  DATABASE_URL: %s", os.Getenv("DATABASE_URL"))
+	log.Printf("  RABBITMQ_URL: %s", os.Getenv("RABBITMQ_URL"))
+	log.Printf("  MINIO_ENDPOINT: %s", os.Getenv("MINIO_ENDPOINT"))
+	log.Printf("  MINIO_ACCESS_KEY: %s", os.Getenv("MINIO_ACCESS_KEY"))
+	log.Printf("  MINIO_SECRET_KEY: %s", os.Getenv("MINIO_SECRET_KEY"))
+	log.Printf("  MINIO_BUCKET: %s", os.Getenv("MINIO_BUCKET"))
+
 	log.Println("🚀 Starting Image Processing Worker...")
 
 	worker := &Worker{}
@@ -129,9 +147,60 @@ func (w *Worker) startWorker(id int, msgs <-chan amqp.Delivery) {
 }
 
 func (w *Worker) processTask(task Task) error {
-	// TODO: реализовать обработку изображения
-	log.Printf("Processing task: %s, operations: %+v", task.TaskID, task.Operations)
-	time.Sleep(2 * time.Second) // имитация работы
+	log.Printf("[Worker] Processing task: %s", task.TaskID)
+
+	// 1. Скачиваем из MinIO
+	reader, err := w.minioClient.GetObject(
+		context.Background(),
+		task.Bucket,
+		task.ObjectName,
+		minio.GetObjectOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get object from MinIO: %v", err)
+	}
+	defer reader.Close()
+
+	// 2. Декодируем изображение
+	img, _, err := image.Decode(reader)
+	if err != nil {
+		return fmt.Errorf("failed to decode image: %v", err)
+	}
+
+	// 3. Применяем операции
+	resultImg := img
+	for _, op := range task.Operations {
+		switch op.Type {
+		case "resize":
+			width := int(op.Params["width"].(float64))
+			height := int(op.Params["height"].(float64))
+			log.Printf("Resizing to %dx%d", width, height)
+			resultImg = imaging.Resize(resultImg, width, height, imaging.Lanczos)
+		}
+	}
+
+	// 4. Сохраняем в буфер
+	buf := new(bytes.Buffer)
+	err = imaging.Encode(buf, resultImg, imaging.JPEG)
+	if err != nil {
+		return fmt.Errorf("failed to encode image: %v", err)
+	}
+
+	// 5. Загружаем обратно в MinIO
+	resultName := fmt.Sprintf("processed/%s.jpg", task.TaskID)
+	_, err = w.minioClient.PutObject(
+		context.Background(),
+		task.Bucket,
+		resultName,
+		bytes.NewReader(buf.Bytes()),
+		int64(buf.Len()),
+		minio.PutObjectOptions{ContentType: "image/jpeg"},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to upload to MinIO: %v", err)
+	}
+
+	log.Printf("[Worker] Task %s completed, saved to %s/%s", task.TaskID, task.Bucket, resultName)
 	return nil
 }
 

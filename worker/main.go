@@ -25,7 +25,7 @@ import (
 type Task struct {
 	TaskID     string      `json:"task_id"`
 	Operations []Operation `json:"operations"`
-	ObjectName string      `json:"object_name"` // вместо SourcePath
+	ObjectName string      `json:"object_name"`
 	Bucket     string      `json:"bucket"`
 }
 
@@ -53,8 +53,6 @@ func main() {
 	log.Printf("  MINIO_SECRET_KEY: %s", os.Getenv("MINIO_SECRET_KEY"))
 	log.Printf("  MINIO_BUCKET: %s", os.Getenv("MINIO_BUCKET"))
 
-	log.Println("🚀 Starting Image Processing Worker...")
-
 	worker := &Worker{}
 
 	// Подключение к RabbitMQ
@@ -77,12 +75,12 @@ func main() {
 
 	// Объявляем очередь
 	q, err := worker.rabbitCh.QueueDeclare(
-		"image_tasks", // name
-		true,          // durable
-		false,         // delete when unused
-		false,         // exclusive
-		false,         // no-wait
-		nil,           // arguments
+		"image_tasks",
+		true,
+		false,
+		false,
+		false,
+		nil,
 	)
 	if err != nil {
 		log.Fatalf("Failed to declare queue: %v", err)
@@ -90,13 +88,13 @@ func main() {
 
 	// Получаем сообщения из очереди
 	msgs, err := worker.rabbitCh.Consume(
-		q.Name, // queue
-		"",     // consumer
-		false,  // auto-ack (false для ручного подтверждения)
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
+		q.Name,
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
 	)
 	if err != nil {
 		log.Fatalf("Failed to register consumer: %v", err)
@@ -124,23 +122,19 @@ func (w *Worker) startWorker(id int, msgs <-chan amqp.Delivery) {
 		var task Task
 		if err := json.Unmarshal(msg.Body, &task); err != nil {
 			log.Printf("[Worker %d] Failed to parse task: %v", id, err)
-			msg.Nack(false, false) // reject, don't requeue
+			msg.Nack(false, false)
 			continue
 		}
 
-		// Обновляем статус в БД
 		w.updateTaskStatus(task.TaskID, "processing")
 
-		// Обрабатываем изображение
 		if err := w.processTask(task); err != nil {
 			log.Printf("[Worker %d] Failed to process task %s: %v", id, task.TaskID, err)
 			w.updateTaskStatus(task.TaskID, "failed")
-			msg.Nack(false, true) // requeue
+			msg.Nack(false, true)
 			continue
 		}
 
-		// Обновляем статус и подтверждаем сообщение
-		w.updateTaskStatus(task.TaskID, "completed")
 		msg.Ack(false)
 		log.Printf("[Worker %d] Task %s completed", id, task.TaskID)
 	}
@@ -176,6 +170,8 @@ func (w *Worker) processTask(task Task) error {
 			height := int(op.Params["height"].(float64))
 			log.Printf("Resizing to %dx%d", width, height)
 			resultImg = imaging.Resize(resultImg, width, height, imaging.Lanczos)
+		default:
+			log.Printf("Unknown operation type: %s", op.Type)
 		}
 	}
 
@@ -200,26 +196,32 @@ func (w *Worker) processTask(task Task) error {
 		return fmt.Errorf("failed to upload to MinIO: %v", err)
 	}
 
+	// ⭐ ВАЖНО: Сохраняем путь к результату в БД
+	_, err = w.db.Exec(
+		"UPDATE image_tasks SET result_path = $1, status = 'completed', updated_at = NOW() WHERE id = $2",
+		resultName, task.TaskID,
+	)
+	if err != nil {
+		log.Printf("Failed to update result path in DB: %v", err)
+		// Не возвращаем ошибку, так как файл уже сохранён
+	}
+
 	log.Printf("[Worker] Task %s completed, saved to %s/%s", task.TaskID, task.Bucket, resultName)
 	return nil
 }
 
 func (w *Worker) connectRabbitMQ() error {
-	// Читаем URL из переменной окружения
 	url := os.Getenv("RABBITMQ_URL")
 	if url == "" {
 		log.Printf("RABBITMQ_URL not set, using default")
 		url = "amqp://guest:guest@rabbitmq:5672/"
 	}
-
 	log.Printf("Connecting to RabbitMQ at: %s", url)
 
-	// Даем RabbitMQ время на полный старт
 	log.Printf("Waiting 5 seconds for RabbitMQ to fully initialize...")
 	time.Sleep(5 * time.Second)
 
 	var err error
-	// Пытаемся подключиться до 30 раз с интервалом 3 секунды
 	for i := 0; i < 30; i++ {
 		w.rabbitConn, err = amqp.Dial(url)
 		if err == nil {
@@ -229,7 +231,6 @@ func (w *Worker) connectRabbitMQ() error {
 		log.Printf("Failed to connect to RabbitMQ (attempt %d/30): %v", i+1, err)
 		time.Sleep(3 * time.Second)
 	}
-
 	if err != nil {
 		return fmt.Errorf("failed to connect to RabbitMQ after 30 attempts: %v", err)
 	}
@@ -238,7 +239,6 @@ func (w *Worker) connectRabbitMQ() error {
 	if err != nil {
 		return fmt.Errorf("failed to create channel: %v", err)
 	}
-
 	return nil
 }
 
@@ -277,11 +277,9 @@ func (w *Worker) connectDB() error {
 	if err != nil {
 		return err
 	}
-
 	if err := db.Ping(); err != nil {
 		return err
 	}
-
 	w.db = db
 	return nil
 }
@@ -291,7 +289,6 @@ func (w *Worker) updateTaskStatus(taskID, status string) error {
 		log.Printf("DB not connected, skipping status update for task %s: %s", taskID, status)
 		return nil
 	}
-
 	_, err := w.db.Exec(
 		"UPDATE image_tasks SET status = $1, updated_at = NOW() WHERE id = $2",
 		status, taskID,

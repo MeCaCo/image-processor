@@ -1,23 +1,20 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import RedirectResponse
 import uuid
-from datetime import datetime
-import os
-import shutil
-from pathlib import Path
-
-from models import ImageTask
-from database import SessionLocal
-
-import aio_pika
-import json
-import asyncio
+from datetime import datetime, timedelta
 import os
 import logging
 import io
+import json
+import asyncio
+
+from models import ImageTask
+from database import SessionLocal
 from minio import Minio
 from minio.error import S3Error
+import aio_pika
 
-# Настройки MinIO (добавь после импортов)
+# Настройки MinIO
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
@@ -31,14 +28,6 @@ minio_client = Minio(
     secure=False
 )
 
-# Убеждаемся, что бакет существует
-try:
-    if not minio_client.bucket_exists(MINIO_BUCKET):
-        minio_client.make_bucket(MINIO_BUCKET)
-except S3Error as e:
-    log.error(f"MinIO bucket error: {e}")
-
-
 app = FastAPI(
     title="Image Processing Service",
     description="Async image processing with Go workers",
@@ -47,9 +36,12 @@ app = FastAPI(
 
 log = logging.getLogger(__name__)
 
-# Создаем папку для загрузок
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+# Убеждаемся, что бакет существует
+try:
+    if not minio_client.bucket_exists(MINIO_BUCKET):
+        minio_client.make_bucket(MINIO_BUCKET)
+except S3Error as e:
+    log.error(f"MinIO bucket error: {e}")
 
 
 @app.get("/")
@@ -75,7 +67,7 @@ async def send_to_rabbitmq(task_id: str, object_name: str, operations: list):
             task_data = {
                 "task_id": task_id,
                 "operations": operations,
-                "object_name": object_name,  # теперь object_name вместо source_path
+                "object_name": object_name,
                 "bucket": MINIO_BUCKET
             }
 
@@ -96,10 +88,7 @@ async def send_to_rabbitmq(task_id: str, object_name: str, operations: list):
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
-        # Генерируем ID
         file_id = str(uuid.uuid4())
-
-        # Читаем файл в память
         file_content = await file.read()
         file_size = len(file_content)
 
@@ -119,7 +108,7 @@ async def upload_file(file: UploadFile = File(...)):
             id=file_id,
             filename=file.filename,
             status="uploaded",
-            original_path=object_name  # теперь храним путь в MinIO
+            original_path=object_name
         )
         db.add(task)
         db.commit()
@@ -165,3 +154,36 @@ async def list_files():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list files: {str(e)}")
+
+
+@app.get("/download/{task_id}")
+async def download_file(task_id: str):
+    try:
+        db = SessionLocal()
+        task = db.query(ImageTask).filter(ImageTask.id == task_id).first()
+        db.close()
+
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        if task.status != "completed":
+            raise HTTPException(status_code=400, detail=f"File not ready yet. Status: {task.status}")
+
+        if not task.result_path:
+            raise HTTPException(status_code=404, detail="Result file not found")
+
+        # Генерируем временную ссылку на MinIO
+        try:
+            url = minio_client.presigned_get_object(
+                MINIO_BUCKET,
+                task.result_path,
+                expires=timedelta(hours=1)
+            )
+            return RedirectResponse(url)
+        except S3Error as e:
+            log.error(f"MinIO error: {e}")
+            raise HTTPException(status_code=500, detail="Error accessing file")
+
+    except Exception as e:
+        log.error(f"Download failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
